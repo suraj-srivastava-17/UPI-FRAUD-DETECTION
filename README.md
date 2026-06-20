@@ -6,6 +6,14 @@ returns a 0–100 risk score, a verdict, and — where the transaction
 matches a documented scam pattern — a plain-language explanation of
 which one and why.
 
+## Topics
+✅ cybersecurity
+✅ upi
+✅ fraud-detection
+✅ python
+✅ fintech
+✅ india
+✅ security
 
 ## What's real here
 
