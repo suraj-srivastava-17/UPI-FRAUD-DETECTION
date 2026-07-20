@@ -1,134 +1,103 @@
 # UPI FraudScope
 
-A rule-based fraud-risk scoring tool for UPI transactions. Checks a
-transaction (or batch of transactions) against fraud indicators and
-returns a 0–100 risk score, a verdict, and — where the transaction
-matches a documented scam pattern — a plain-language explanation of
-which one and why.
+A **hybrid rule-based + machine learning** fraud-risk scoring system for UPI
+transactions. A trained ML model estimates fraud probability from
+transaction behavior; a rule engine independently flags transactions
+matching known, regulator-documented scam patterns. The two scores are
+combined into a single 0–100 risk verdict with a plain-language
+explanation of *why*.
+
+Why hybrid, not pure ML:
+- **Rules** give instant, explainable, zero-training-needed flags for
+  *known* bad actors (e.g. a UPI ID already reported to
+  cybercrime.gov.in) — and update the moment a new scam ID is added.
+- **ML** generalizes to *new, unseen* fraud patterns that don't match
+  any hardcoded rule, and gives a continuous probability instead of a
+  brittle yes/no.
+- This mirrors how real bank/NPCI fraud systems are actually built: a
+  fast rules layer for known bad actors, plus a statistical model layer
+  for anomaly detection.
 
 ## Topics
-✅ cybersecurity
-✅ upi
-✅ fraud-detection
-✅ python
-✅ fintech
-✅ india
-✅ security
+✅ cybersecurity ✅ upi ✅ fraud-detection ✅ machine-learning
+✅ python ✅ fintech ✅ india ✅ security
 
-## What's real here
+## Pipeline
 
-UPI fraud in India is a large, well-documented, and rapidly growing
-problem. This tool's rules and thresholds are grounded in real public
-sources rather than invented:
+```bash
+pip install -r requirements.txt
 
-- **'fraud_patterns.json'** contains a 'regulatory_context' section and
-  a 'scam_categories' section, each entry cited to a real, checkable
-  source (RBI circulars, RBI's own discussion paper figures, NPCI
-  advisories, I4C public alerts). For example: the "amount just below
-  the UPI transaction limit" rule is a documented evasion pattern, the
-  screen-sharing-app rule comes from an NPCI advisory, and the
-  "₹1 verification payment" rule comes from a specific I4C Q2 2026
-  advisory about fake customer-care pages.
-- There is **no public, queryable database of scam UPI handles** to pull
-  from live — unlike malware threat-intel feeds (which the security
-  research community shares openly), banks and I4C don't publish
-  fraud-account identifiers for obvious reasons. So unlike the companion
-  project's live ThreatFox integration, this project's "known fraud UPI
-  ID" list is explicitly labeled in the file itself as **illustrative,
-  not a real database** — it demonstrates the rule engine, not a usable
-  blocklist.
-- Transaction data is synthetic, since real UPI transaction logs aren't
-  public (for obvious privacy reasons) — built only to demonstrate the
-  detector working end to end.
+# 1. Generate a synthetic labeled transaction dataset (~20k rows, ~6% fraud)
+python generate_data.py
 
-This is the same honest pattern used in the companion project, **APT
-Hunter India**: ground every rule in a real, checkable source where one
-exists, and clearly label what's illustrative where it doesn't.
+# 2. Train and compare 3 models, save the best one
+python train_model.py
+
+# 3. Run the hybrid detector (loads fraud_model.joblib + rule engine)
+python fraud_detector.py
+```
+
+`train_model.py` trains **Logistic Regression, Random Forest, and
+Gradient Boosting**, evaluates all three with a stratified train/test
+split (fraud is rare, so stratification keeps the ratio intact), and
+selects the best model by **PR-AUC** — not accuracy, since accuracy is
+misleading when ~94% of transactions are legitimate. It also prints a
+confusion matrix and feature importances for the winning model.
+
+**Last run: Gradient Boosting won, PR-AUC = 0.9916** (ROC-AUC 0.9995,
+fraud-class precision 0.956 / recall 0.943 on a held-out test set).
+
+*Caveat worth stating up front: `amount` alone drives ~82% of the
+model's decisions. That likely reflects the synthetic data generator
+making fraud/legit amounts fall in fairly distinct ranges — real
+transactions would probably be noisier. The obvious next step, given
+access to real or anonymized data, would be to check whether this
+separation holds up.*
+
+`fraud_detector.py` then combines the trained model's fraud probability
+(65% weight) with the rule engine's flags (35% weight) into a final
+score, with one hard override: a UPI ID already confirmed fraudulent
+always blocks regardless of the model's score.
 
 ## Files
 
 | File | Purpose |
-| 'upi_fraudscope.py' | main script |
-| 'fraud_patterns.json' | cited regulatory context + scam categories + sample fraud-ID list |
-| 'sample_txn_fraud.json' | demo — a single transaction matching a KBC/lottery scam pattern |
-| 'sample_txn_safe.json' | demo — a single ordinary, low-risk transaction |
-| 'sample_txn_batch.json' | demo — six transactions analyzed together (batch mode) |
+|---|---|
+| `generate_data.py` | generates the synthetic labeled training dataset |
+| `train_model.py` | trains/compares 3 models, saves the best as `fraud_model.joblib` |
+| `fraud_detector.py` | hybrid detector — combines the trained model + rule engine |
+| `upi_fraudscope.py` | standalone rule-only detector (no ML dependency, fully interpretable) |
+| `fraud_patterns.json` | cited regulatory context + scam categories + sample fraud-ID list |
+| `requirements.txt` | dependencies |
+| `sample_txn_fraud.json` / `sample_txn_safe.json` / `sample_txn_batch.json` | demo transactions for `upi_fraudscope.py` |
 
+## What's real here
 
-## Running the demos
+UPI fraud in India is a large, well-documented, rapidly growing problem.
+The rules and thresholds are grounded in real public sources, not invented:
 
-'''bash
-# Single fraudulent transaction
-python upi_fraudscope.py sample_txn_fraud.json
+- `fraud_patterns.json` cites RBI circulars, RBI discussion-paper
+  figures, NPCI advisories, and I4C public alerts for each rule — e.g.
+  the "amount just below the UPI limit" rule is a documented evasion
+  pattern, and the "₹1 verification payment" rule comes from a specific
+  I4C Q2 2026 advisory on fake customer-care pages.
+- There's no public, queryable database of scam UPI handles (unlike
+  malware threat-intel feeds, banks/I4C don't publish fraud-account
+  identifiers). So the "known fraud UPI ID" list is explicitly labeled
+  as **illustrative, not a real database** — it demonstrates the rule
+  engine, not a usable blocklist.
+- Training data is synthetic, since real UPI transaction logs aren't
+  public. `generate_data.py` simulates transactions using distributions
+  that mirror publicly documented UPI fraud typologies — the standard
+  approach in academic fraud-detection work when real data isn't
+  accessible.
 
-# Single safe transaction
-python upi_fraudscope.py sample_txn_safe.json
+## Scope and honesty
 
-# Batch of six transactions, with exports
-python upi_fraudscope.py sample_txn_batch.json --batch --export json --export csv
-'''
-
-## All CLI options
-
-'''bash
-python upi_fraudscope.py <transactions_file.json> [options]
-
-  --batch              treat the input as a list of transactions
-                       (default: a single transaction object)
-  --patterns PATH      use a different fraud patterns file
-                       (default: fraud_patterns.json)
-  --export json        also write fraud_report.json
-  --export csv         also write fraud_alerts.csv
-  --quiet              skip the rule-by-rule scan output
-'''
-
-## Running on your own transaction
-
-Any JSON object with this shape works:
-
-'''json
-{
-  "amount": 49999,
-  "recipient_upi": "someone@bank",
-  "timestamp": "2026-06-14 02:30:45",
-  "payment_note": "free text",
-  "is_new_recipient": true,
-  "new_device": true,
-  "device_name": "device label",
-  "transactions_last_hour": 5,
-  "location_mismatch": true,
-  "home_city": "Delhi",
-  "current_city": "Mumbai"
-}
-'''
-
-All fields except 'amount' and 'recipient_upi' are optional — missing
-fields just mean the related rule won't fire.
-
-## What it checks, and why
-
-| Rule | Source / rationale |
-
-| Unusual transaction time | Heuristic (late-night/early-morning activity is a common social-engineering window) |
-| High value transaction | Heuristic threshold |
-| New recipient | Heuristic — first-time payees carry more risk |
-| Amount just below the UPI limit | Documented evasion pattern — staying under a threshold avoids extra verification |
-| High transaction frequency | Heuristic — rapid repeated transfers suggest urgency/pressure tactics |
-| Unrecognized device | Heuristic, aligned with RBI's broader push for device-based risk signals |
-| Location mismatch | Heuristic |
-| Suspicious UPI ID keyword | Built from documented scam-category keywords (prize, customs, helpdesk, etc.) |
-| Known scam payment note | Same — matched against the same cited scam categories |
-| Known fraud UPI ID | Illustrative sample list only — see note above |
-
-Full citations for the scam categories and regulatory figures are in
-'fraud_patterns.json'.
-
-## A note on scope and honesty
-
-This tool demonstrates a detection *pipeline* — rule scoring, scam-
-category attribution, batch processing, exportable reports — built on
-real regulatory context. It is not, and doesn't claim to be, a
-production fraud-detection system: real systems use far more signals
-(device fingerprinting, behavioral biometrics, network-graph analysis
-for mule accounts — see RBI's "MuleHunter.AI", cited in
-'fraud_patterns.json') than a single-transaction rule engine can capture.
+This demonstrates a full detection *pipeline* — synthetic data
+generation, model training/evaluation/selection, hybrid rule+ML
+scoring, batch processing — built on real regulatory context. It does
+not claim to be a production system: real deployments use far more
+signals (device fingerprinting, behavioral biometrics, network-graph
+analysis for mule accounts — see RBI's "MuleHunter.AI", cited in
+`fraud_patterns.json`) than this pipeline captures.
