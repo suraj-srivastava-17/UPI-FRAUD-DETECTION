@@ -1,173 +1,245 @@
-
-# UPI FraudScope
-
-A **hybrid rule-based + machine learning** fraud-risk scoring system for UPI
-transactions. A trained ML model estimates fraud probability from
-transaction behavior; a rule engine independently flags transactions
-matching known, regulator-documented scam patterns. The two scores are
-combined into a single 0–100 risk verdict with a plain-language
-explanation of *why*. It can run as a batch pipeline or as a **real-time API**
-that scores each payment as it arrives.
+"""
+fraud_detector.py
+==================
+HYBRID UPI FRAUD DETECTOR — Rules Engine + Trained ML Model
 
 Why hybrid, not pure ML:
-- **Rules** give instant, explainable, zero-training-needed flags for
-  *known* bad actors (e.g. a UPI ID already reported to
-  cybercrime.gov.in) — and update the moment a new scam ID is added.
-- **ML** generalizes to *new, unseen* fraud patterns that don't match
-  any hardcoded rule, and gives a continuous probability instead of a
-  brittle yes/no.
-- This mirrors how real bank/NPCI fraud systems are actually built: a
-  fast rules layer for known bad actors, plus a statistical model layer
-  for anomaly detection.
+  - Rules give instant, explainable, zero-latency flags for KNOWN patterns
+    (e.g. a UPI ID already reported to cybercrime.gov.in) -- no model
+    training needed, updates instantly when new scam IDs are reported.
+  - ML generalizes to NEW/unseen fraud patterns that don't match any
+    hardcoded rule, and gives a continuous risk score instead of a
+    brittle yes/no.
+  - This mirrors how real bank/NPCI fraud systems work in practice:
+    a fast rules layer for known bad actors + a statistical model layer
+    for anomaly detection.
 
-## Topics
-✅ cybersecurity ✅ upi ✅ fraud-detection ✅ machine-learning
-✅ python ✅ fintech ✅ india ✅ security ✅ real-time ✅ fastapi
+FINAL_SCORE = w_rules * rule_score + w_ml * ml_probability * 100
+"""
 
-## Pipeline
+import json
+import os
+import threading
+import warnings
 
-```bash
-pip install -r requirements.txt
+import joblib
+import numpy as np
 
-# 1. Generate a synthetic labeled transaction dataset (~20k rows, ~6% fraud)
-python generate_data.py
+MODEL_PATH = "fraud_model.joblib"
+PATTERNS_PATH = "fraud_patterns.json"
 
-# 2. Train and compare 3 models, save the best one
-python train_model.py
+_lock = threading.Lock()
+ML_MODEL = ML_SCALER = ML_FEATURES = ML_NAME = None
 
-# 3. Run the hybrid detector (loads fraud_model.joblib + rule engine)
-python fraud_detector.py
-```
 
-`train_model.py` trains **Logistic Regression, Random Forest, and
-Gradient Boosting**, evaluates all three with a stratified train/test
-split (fraud is rare, so stratification keeps the ratio intact), and
-selects the best model by **PR-AUC** — not accuracy, since accuracy is
-misleading when ~94% of transactions are legitimate. It also prints a
-confusion matrix and feature importances for the winning model.
+def load_model(path=MODEL_PATH):
+    """Load (or hot-reload) the trained model. Safe to call while serving."""
+    global ML_MODEL, ML_SCALER, ML_FEATURES, ML_NAME
+    artifact = joblib.load(path)
+    with _lock:
+        ML_MODEL = artifact["model"]
+        ML_SCALER = artifact["scaler"]
+        ML_FEATURES = artifact["features"]
+        ML_NAME = artifact["model_name"]
+    return ML_NAME
 
-**Last run: Gradient Boosting won, PR-AUC = 0.9583** (ROC-AUC 0.9968,
-fraud-class precision 0.904 / recall 0.850 on a held-out test set).
 
-*How the data was made realistic:* an earlier version of the generator let
-`amount` alone drive ~82% of the model's decisions, because fraud and legitimate
-amounts barely overlapped, and it treated every never-seen recipient as fraud.
-The generator now includes big-ticket legitimate payments (deposits, electronics,
-tuition) and legitimate first-time recipients, and adds a personal-baseline
-feature, `amount_vs_usual` (this payment divided by the sender's own average).
-`amount` now carries ~19% of the importance. This is what lets the system catch a
-Rs 98,500 "digital arrest" transfer from a customer who normally pays Rs 1-3k,
-while a planned Rs 75,000 bike purchase is only asked for an extra check.
-The data is still synthetic, so these numbers show the method, not real-world accuracy.
+try:
+    load_model()
+except FileNotFoundError:
+    raise SystemExit("fraud_model.joblib not found. Run train_model.py first.")
 
-`fraud_detector.py` then combines the trained model's fraud probability
-(65% weight) with the rule engine's flags (35% weight) into a final
-score, with three overrides: a UPI ID already confirmed fraudulent always
-blocks; two independent scam rules firing together (e.g. scam-style ID plus
-scam-style note) never score below WARN, even for tiny amounts; and a payment
-of Rs 50,000 or more to a first-time recipient always gets at least an extra check.
 
-## Real-time API
+def load_known_fraud_ids(path=PATTERNS_PATH):
+    """Single source of truth: fraud_patterns.json (no duplicate hardcoded list)."""
+    with open(path) as f:
+        return set(json.load(f)["known_fraud_upi_ids_sample"]["ids"])
 
-The detector also runs as a service that scores each payment as it arrives.
+# ── Rule engine (kept from original prototype, still useful for
+#    known/reported fraud UPI IDs and scam keyword matching) ────────
+SCAM_KEYWORDS_UPI = ["prize", "lottery", "winner", "reward", "free", "lucky",
+                      "claim", "customs", "rescue", "helpdesk", "support", "refund", "kbc",
+                      "hrdesk", "recruit", "fedex", "parcel"]
+SCAM_NOTES = ["kbc", "lottery", "prize", "customs clearance", "digital arrest",
+              "fedex", "income tax", "blocking your account", "court order",
+              "job registration", "registration fee", "processing fee",
+              "clearance fee", "verification payment", "trading profit",
+              "investment"]
+KNOWN_FRAUD_UPIIDS = load_known_fraud_ids()
 
-```bash
-uvicorn app:app --port 8000      # terminal 1: start the API
-python simulate.py               # terminal 2: scenarios + latency test
-```
+RULES = {
+    "Just Below Reporting Limit (₹48K-50K / ₹98K-1L)":
+        lambda t: (48000 <= t["amount"] <= 49999) or (98000 <= t["amount"] <= 99999),
+    "Suspicious UPI ID Keywords":
+        lambda t: any(k in t.get("upi", "").lower() for k in SCAM_KEYWORDS_UPI),
+    "Scam Payment Note Detected":
+        lambda t: any(k in t.get("note", "").lower() for k in SCAM_NOTES),
+    "UPI ID in Reported-Fraud Database":
+        lambda t: t.get("upi", "") in KNOWN_FRAUD_UPIIDS,
+}
+RULE_SCORES = {
+    "Just Below Reporting Limit (₹48K-50K / ₹98K-1L)": 25,
+    "Suspicious UPI ID Keywords": 30,
+    "Scam Payment Note Detected": 35,
+    "UPI ID in Reported-Fraud Database": 45,
+}
 
-Example request:
+# Weighting: ML carries more weight since it's evaluated (PR-AUC ~0.99);
+# rules act as a fast override for definitively known bad actors.
+W_RULES = 0.35
+W_ML = 0.65
 
-```bash
-curl -X POST localhost:8000/score -H "Content-Type: application/json" \
-  -d '{"sender_id":"priya","recipient_upi":"claim.kbc.prize.2026@ybl","amount":49999,"note":"KBC Lottery Prize Processing Fee"}'
-```
 
-Example response (shortened):
+def apply_rules(txn: dict):
+    hits, score = [], 0
+    for rule, check in RULES.items():
+        if check(txn):
+            hits.append(rule)
+            score += RULE_SCORES[rule]
+    return hits, min(100, score)
 
-```json
-{"verdict": "BLOCK", "final_score": 96.4, "ml_fraud_probability": 0.9978,
- "rule_hits": ["Just Below Reporting Limit ...", "Suspicious UPI ID Keywords", "Scam Payment Note Detected"],
- "latency_ms": 1.12}
-```
 
-How a payment is scored:
-1. `app.py` receives the raw payment (sender, recipient, amount, note, device, location).
-2. `feature_store.py` builds the 12 model features from the sender's history
-   (payments in the last hour, new recipient, new device, location change, etc.).
-3. `fraud_detector.py` combines the rule score (35%) and model probability (65%).
-4. The API returns SAFE / CAUTION / WARN / BLOCK with the reasons, then updates the history.
-   A blocked recipient or device is never saved as trusted.
+def ml_predict(txn: dict):
+    """txn must contain every feature in ML_FEATURES.
+    Missing features raise an error instead of silently becoming 0 --
+    in a live system a silent 0 would quietly LOWER the fraud score."""
+    with _lock:
+        model, scaler, features = ML_MODEL, ML_SCALER, ML_FEATURES
+    missing = [f for f in features if f not in txn]
+    if missing:
+        raise ValueError(f"Missing ML features: {missing}")
+    X = np.array([[float(txn[f]) for f in features]])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # numpy input vs model fitted on a DataFrame
+        if scaler is not None:
+            X = scaler.transform(X)
+        return float(model.predict_proba(X)[0, 1])
 
-| Endpoint | Purpose |
-|---|---|
-| `POST /score` | score one payment |
-| `POST /feedback` | report the true outcome later (fraud / legit) |
-| `POST /reload` | load a newly trained model without restarting |
-| `GET /health` | check the service is running |
 
-Keeping the model current: fraud labels arrive days after a payment, so the
-system scores live and **retrains on a schedule** instead of learning after every
-transaction. `python retrain.py` combines logged payments with confirmed labels
-from `/feedback` and replaces the model only if the new one is at least as good.
+def verdict(score):
+    if score >= 70:
+        return "BLOCK", "HIGH FRAUD RISK — transaction blocked"
+    if score >= 45:
+        return "WARN", "SUSPICIOUS — manual review required"
+    if score >= 20:
+        return "CAUTION", "VERIFY RECIPIENT — extra OTP step required"
+    return "SAFE", "LOW RISK — transaction allowed"
 
-By default, history is kept in memory. Set `REDIS_URL=redis://localhost:6379/0`
-to keep it in Redis instead.
 
-Measured on a single sandbox machine (100–300 requests, 8 threads): about
-500 requests/sec, ~0.6 ms median server time, ~13–16 ms median round trip.
-Re-measure on your own hardware.
+def analyze_transaction(txn: dict):
+    """
+    txn: dict with keys — amount, amount_vs_usual, hour, is_new_recipient, is_new_device,
+    txns_last_hour, location_jump, recipient_age_days,
+    sender_account_age_days, contains_urgency_words,
+    upi_id_suspicious_keyword, is_known_fraud_upi_db,
+    plus optional 'upi' and 'note' strings for the rule engine.
+    """
+    rule_hits, rule_score = apply_rules(txn)
+    ml_proba = ml_predict(txn)
+    ml_score = ml_proba * 100
 
-## Files
+    final_score = round(W_RULES * rule_score + W_ML * ml_score, 1)
+    # Corroboration floor: two independent scam rules firing together (e.g. a
+    # scam-style ID AND a scam-style note) is strong evidence even when the
+    # amount is tiny and the model is unsure -- never let it pass as SAFE.
+    if len(rule_hits) >= 2:
+        final_score = max(final_score, 45.0)
+    # Hard override: a UPI ID already confirmed fraudulent always blocks,
+    # regardless of what the model says.
+    if txn.get("upi", "") in KNOWN_FRAUD_UPIIDS:
+        final_score = 100.0
 
-| File | Purpose |
-|---|---|
-| `generate_data.py` | generates the synthetic labeled training dataset |
-| `train_model.py` | trains/compares 3 models, saves the best as `fraud_model.joblib` |
-| `fraud_detector.py` | hybrid detector — combines the trained model + rule engine |
-| `app.py` | real-time FastAPI service: `/score`, `/feedback`, `/reload`, `/health` |
-| `feature_store.py` | builds model features from user history (in-memory or Redis) |
-| `retrain.py` | scheduled retraining from logged payments + confirmed fraud labels |
-| `simulate.py` | sends test payments to the API and measures latency |
-| `demo_story.py` | four realistic stories (normal day, digital arrest, stolen phone, fake job) plus a type-your-own mode; starts its own API |
-| `upi_fraudscope.py` | standalone rule-only detector (no ML dependency, fully interpretable) |
-| `fraud_patterns.json` | cited regulatory context + scam categories + sample fraud-ID list |
-| `requirements.txt` | dependencies |
-| `sample_txn_fraud.json` / `sample_txn_safe.json` / `sample_txn_batch.json` | demo transactions for `upi_fraudscope.py` |
+    # Step-up policy: a high-value payment to someone never paid before is not
+    # a scam by itself, but it should never pass without at least an extra check.
+    if txn.get("amount", 0) >= 50000 and txn.get("is_new_recipient"):
+        final_score = max(final_score, 20.0)
 
-## What's real here
+    label, action = verdict(final_score)
 
-UPI fraud in India is a large, well-documented, rapidly growing problem.
-The rules and thresholds are grounded in real public sources, not invented:
+    return {
+        "rule_hits": rule_hits,
+        "rule_score": rule_score,
+        "ml_model": ML_NAME,
+        "ml_fraud_probability": round(ml_proba, 4),
+        "final_score": final_score,
+        "verdict": label,
+        "action": action,
+    }
 
-- `fraud_patterns.json` cites RBI circulars, RBI discussion-paper
-  figures, NPCI advisories, and I4C public alerts for each rule — e.g.
-  the "amount just below the UPI limit" rule is a documented evasion
-  pattern, and the "₹1 verification payment" rule comes from a specific
-  I4C Q2 2026 advisory on fake customer-care pages.
-- There's no public, queryable database of scam UPI handles (unlike
-  malware threat-intel feeds, banks/I4C don't publish fraud-account
-  identifiers). So the "known fraud UPI ID" list is explicitly labeled
-  as **illustrative, not a real database** — it demonstrates the rule
-  engine, not a usable blocklist.
-- Training data is synthetic, since real UPI transaction logs aren't
-  public. `generate_data.py` simulates transactions using distributions
-  that mirror publicly documented UPI fraud typologies — the standard
-  approach in academic fraud-detection work when real data isn't
-  accessible.
 
-## Scope and honesty
+# ── Demo: original 7 scam scenarios, now scored by the hybrid system ──
+DEMO_TXNS = {
+    "KBC Lottery Scam": {
+        "amount": 49999, "hour": 14, "is_new_recipient": 1, "is_new_device": 0,
+        "amount_vs_usual": 8,
+        "txns_last_hour": 1, "location_jump": 0, "recipient_age_days": 2,
+        "sender_account_age_days": 900, "contains_urgency_words": 1,
+        "upi_id_suspicious_keyword": 1, "is_known_fraud_upi_db": 0,
+        "upi": "claim.kbc.prize.2026@ybl", "note": "KBC Lottery Prize Processing Fee",
+    },
+    "FedEx / Customs Scam": {
+        "amount": 85000, "hour": 15, "is_new_recipient": 1, "is_new_device": 1,
+        "amount_vs_usual": 20,
+        "txns_last_hour": 2, "location_jump": 0, "recipient_age_days": 1,
+        "sender_account_age_days": 500, "contains_urgency_words": 1,
+        "upi_id_suspicious_keyword": 1, "is_known_fraud_upi_db": 1,
+        "upi": "customs.helpdesk@upi", "note": "customs clearance fine urgent",
+    },
+    "Digital Arrest Scam": {
+        "amount": 99500, "hour": 3, "is_new_recipient": 1, "is_new_device": 0,
+        "amount_vs_usual": 40,
+        "txns_last_hour": 5, "location_jump": 0, "recipient_age_days": 1,
+        "sender_account_age_days": 1200, "contains_urgency_words": 1,
+        "upi_id_suspicious_keyword": 0, "is_known_fraud_upi_db": 1,
+        "upi": "digitalrescue@ybl", "note": "digital arrest bail payment urgent",
+    },
+    "Fake Job Offer Scam": {
+        "amount": 2999, "hour": 11, "is_new_recipient": 1, "is_new_device": 0,
+        "amount_vs_usual": 15,
+        "txns_last_hour": 1, "location_jump": 0, "recipient_age_days": 5,
+        "sender_account_age_days": 200, "contains_urgency_words": 1,
+        "upi_id_suspicious_keyword": 0, "is_known_fraud_upi_db": 1,
+        "upi": "jobs.registration@paytm", "note": "Google job registration fee",
+    },
+    "Investment / Trading Scam": {
+        "amount": 15000, "hour": 13, "is_new_recipient": 1, "is_new_device": 0,
+        "amount_vs_usual": 6,
+        "txns_last_hour": 1, "location_jump": 0, "recipient_age_days": 10,
+        "sender_account_age_days": 700, "contains_urgency_words": 0,
+        "upi_id_suspicious_keyword": 0, "is_known_fraud_upi_db": 1,
+        "upi": "trading.profit@okaxis", "note": "trading group membership profit",
+    },
+    "Stolen Phone Account Takeover": {
+        "amount": 49800, "hour": 1, "is_new_recipient": 1, "is_new_device": 1,
+        "amount_vs_usual": 12,
+        "txns_last_hour": 7, "location_jump": 1, "recipient_age_days": 30,
+        "sender_account_age_days": 800, "contains_urgency_words": 0,
+        "upi_id_suspicious_keyword": 0, "is_known_fraud_upi_db": 0,
+        "upi": "unknown.receiver99@ybl", "note": "transfer",
+    },
+    "Legitimate Rent Payment (control)": {
+        "amount": 8000, "hour": 10, "is_new_recipient": 0, "is_new_device": 0,
+        "amount_vs_usual": 1,
+        "txns_last_hour": 1, "location_jump": 0, "recipient_age_days": 400,
+        "sender_account_age_days": 1500, "contains_urgency_words": 0,
+        "upi_id_suspicious_keyword": 0, "is_known_fraud_upi_db": 0,
+        "upi": "ramesh.landlord@okhdfc", "note": "monthly rent June 2026",
+    },
+}
 
-This demonstrates a full detection *pipeline* — synthetic data
-generation, model training/evaluation/selection, hybrid rule+ML
-scoring, batch processing, a real-time scoring API, history-based
-features, and scheduled retraining — built on real regulatory context.
-It does not claim to be a production system: real deployments use far
-more signals (device fingerprinting, behavioral biometrics, network-graph
-analysis for mule accounts — see RBI's "MuleHunter.AI", cited in
-`fraud_patterns.json`) than this pipeline captures.
 
-The real-time API is a working prototype, not a hardened service: it has no
-authentication or rate limiting, the score log is a plain file, and the model
-is trained on synthetic data, so its scores should not be read as real-world
-accuracy.
+def run_demo():
+    print(f"\nUsing ML model: {ML_NAME}  (rules weight={W_RULES}, ML weight={W_ML})\n")
+    print(f"{'Scenario':<35}{'Rules':<8}{'ML Prob':<10}{'Final':<8}{'Verdict':<10}Action")
+    print("-" * 110)
+    for name, txn in DEMO_TXNS.items():
+        r = analyze_transaction(txn)
+        print(f"{name:<35}{r['rule_score']:<8}{r['ml_fraud_probability']:<10}"
+              f"{r['final_score']:<8}{r['verdict']:<10}{r['action']}")
+        if r["rule_hits"]:
+            print(f"    Rule flags: {', '.join(r['rule_hits'])}")
+    print()
+
+
+if __name__ == "__main__":
+    run_demo()
