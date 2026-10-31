@@ -7,7 +7,7 @@ matching known, regulator-documented scam patterns. The two scores are
 combined into a single 0–100 risk verdict with a plain-language
 explanation of *why*.
 
-Why hybrid, not pure ML:
+
 - **Rules** give instant, explainable, zero-training-needed flags for
   *known* bad actors (e.g. a UPI ID already reported to
   cybercrime.gov.in) — and update the moment a new scam ID is added.
