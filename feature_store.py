@@ -145,4 +145,21 @@ class RedisFeatureStore:
         feats.update(_text_features(req))
         return feats
 
-    
+    def record(self, req, allow_learning):
+        now = req.get("timestamp") or time.time()
+        s, rcp = req["sender_id"], req["recipient_upi"]
+        pipe = self.r.pipeline()
+        pipe.zadd(f"recent:{s}", {f"{now}:{uuid.uuid4().hex}": now})
+        pipe.zremrangebyscore(f"recent:{s}", "-inf", now - HOUR)
+        pipe.expire(f"recent:{s}", HOUR * 2)
+        pipe.setnx(f"sender_first:{s}", now)
+        pipe.setnx(f"upi_first:{rcp}", now)
+        if allow_learning:
+            pipe.incrbyfloat(f"amt_sum:{s}", float(req["amount"]))
+            pipe.incr(f"amt_n:{s}")
+            pipe.sadd(f"recipients:{s}", rcp)
+            if req.get("device_id"):
+                pipe.sadd(f"devices:{s}", req["device_id"])
+            if req.get("location"):
+                pipe.setnx(f"home:{s}", req["location"])
+        pipe.execute()
